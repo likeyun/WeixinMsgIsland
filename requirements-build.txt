@@ -1,2 +1,4 @@
 Pillow>=10.0
 PyInstaller>=6.0
+uiautomation>=2.0.29
+

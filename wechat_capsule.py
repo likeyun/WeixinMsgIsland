@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-wechat_capsule.py —— 微信提醒胶囊（Windows；核心仅标准库，Pillow 为可选的美化依赖）
+wechat_capsule.py —— 微信提醒胶囊（Windows；Pillow 可选，UI Automation 用于精确唤起账号）
 
 原理：
   用 RegisterShellHookWindow 注册一个隐藏窗口，接收系统广播的 HSHELL_FLASH
   （某窗口请求任务栏关注 = 图标闪烁）。通过闪烁窗口所属进程的可执行文件名
-  判断是否为微信（Weixin.exe / WeChat.exe），是则在屏幕顶部弹出胶囊提示。
+  判断是否为微信（Weixin.exe / WeChat.exe），并按窗口句柄分别跟踪提醒。
 
   提醒来源是 Shell Hook；有提醒时显示绿点，不统计未读条数。
 
@@ -19,7 +19,7 @@ wechat_capsule.py —— 微信提醒胶囊（Windows；核心仅标准库，Pil
   python wechat_capsule.py --exe my.exe   # 额外匹配其他进程名（可多次指定）
 
 操作：
-  左键点击胶囊      打开微信（通过 weixin:// 协议，让微信自己恢复窗口）
+  左键点击胶囊      点击对应账号的微信托盘项；无目标时通过 weixin:// 打开微信
   按住左键拖动      把胶囊拖到屏幕任意位置（位置会被记住）
   右键点击胶囊      菜单：恢复到顶部 / 模拟提醒 / 退出
   点击托盘图标      菜单：恢复胶囊位置 / 退出程序
@@ -41,6 +41,11 @@ import time
 import traceback
 from ctypes import wintypes
 
+try:
+    import uiautomation as _uia
+except Exception:
+    _uia = None
+
 # ----------------------------------------------------------------------------
 # Win32 常量
 # ----------------------------------------------------------------------------
@@ -48,6 +53,7 @@ HSHELL_REDRAW = 6
 HSHELL_WINDOWACTIVATED = 4
 HSHELL_FLASH = 0x8006  # HSHELL_REDRAW | HSHELL_HIGHBIT
 HSHELL_RUDEAPPACTIVATED = 0x8004
+GW_OWNER = 4
 
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
@@ -91,6 +97,15 @@ class GUID(ctypes.Structure):
         ("Data2", wintypes.WORD),
         ("Data3", wintypes.WORD),
         ("Data4", wintypes.BYTE * 8),
+    ]
+
+
+class NOTIFYICONIDENTIFIER(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("guidItem", GUID),
     ]
 
 
@@ -178,6 +193,10 @@ def load_win32():
         ctypes.c_ssize_t,
     ]
     _u.EnumWindows.restype = wintypes.BOOL
+    _u.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    _u.GetWindow.restype = wintypes.HWND
+    _u.IsWindow.argtypes = [wintypes.HWND]
+    _u.IsWindow.restype = wintypes.BOOL
     _u.IsWindowVisible.argtypes = [wintypes.HWND]
     _u.IsWindowVisible.restype = wintypes.BOOL
     _u.IsIconic.argtypes = [wintypes.HWND]
@@ -192,6 +211,10 @@ def load_win32():
     _u.GetWindowThreadProcessId.restype = wintypes.DWORD
     _u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     _u.GetWindowTextW.restype = ctypes.c_int
+    _u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    _u.GetClassNameW.restype = ctypes.c_int
+    _u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    _u.ShowWindow.restype = wintypes.BOOL
     _u.LoadImageW.argtypes = [
         wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
         ctypes.c_int, ctypes.c_int, wintypes.UINT,
@@ -264,6 +287,251 @@ def window_title(hwnd):
     return buf.value
 
 
+def window_class(hwnd):
+    if not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(256)
+    _u.GetClassNameW(hwnd, buf, len(buf))
+    return buf.value
+
+
+def is_wechat_main_window(hwnd, exe_names, expected_pid=None):
+    """只接受可验证的微信主窗，不操作 Shell Hook 的代理/托盘窗口。"""
+    if not hwnd or not _u.IsWindow(hwnd):
+        return False
+    pid = wintypes.DWORD(0)
+    _u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if expected_pid and pid.value != int(expected_pid):
+        return False
+    exe = process_image(hwnd)
+    if not exe or os.path.basename(exe).lower() not in exe_names:
+        return False
+    if window_class(hwnd).lower() != "qt51514qwindowicon":
+        return False
+    return window_title(hwnd).strip().lower() in WECHAT_TITLES
+
+
+def resolve_wechat_main_window(source_hwnd, source_pid, exe_names):
+    """把闪烁源句柄解析到同一实例的主窗口；不确定时返回 0。"""
+    current = int(source_hwnd or 0)
+    visited = set()
+    while current and current not in visited:
+        visited.add(current)
+        if is_wechat_main_window(current, exe_names):
+            return current
+        current = int(_u.GetWindow(current, GW_OWNER) or 0)
+
+    if not source_pid:
+        return 0
+    matches = []
+    exact_titles = []
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, ctypes.c_ssize_t)
+
+    @enum_proc
+    def visit(hwnd, _lparam):
+        if is_wechat_main_window(hwnd, exe_names, source_pid):
+            matches.append(int(hwnd))
+            if window_title(hwnd).strip() == "微信":
+                exact_titles.append(int(hwnd))
+        return True
+
+    _u.EnumWindows(visit, 0)
+    if len(exact_titles) == 1:
+        return exact_titles[0]
+    if len(matches) == 1:
+        return matches[0]
+    return 0
+
+
+def next_pending_window_handle(pending_windows, last_opened_hwnd):
+    """只轮换仍有效且通过微信主窗校验的提醒窗口。"""
+    handles = [handle for handle in pending_windows
+               if handle > 0 and is_wechat_main_window(handle, DEFAULT_EXE_NAMES)]
+    if not handles:
+        return None
+    if last_opened_hwnd in handles:
+        return handles[(handles.index(last_opened_hwnd) + 1) % len(handles)]
+    return handles[0]
+
+
+def _wechat_tray_owner_windows():
+    """Find one verified WeChat tray callback window per running process."""
+    owners = {}
+    ambiguous = set()
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, ctypes.c_ssize_t)
+
+    @enum_proc
+    def visit(hwnd, _lparam):
+        if window_class(hwnd) != "Qt51514WxTrayIconMessageWindowClass":
+            return True
+        pid = wintypes.DWORD(0)
+        _u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        exe = process_image(hwnd)
+        if (not pid.value or not exe
+                or os.path.basename(exe).lower() not in DEFAULT_EXE_NAMES):
+            return True
+        if pid.value in owners:
+            ambiguous.add(pid.value)
+        owners[pid.value] = int(hwnd)
+        return True
+
+    _u.EnumWindows(visit, 0)
+    for pid in ambiguous:
+        owners.pop(pid, None)
+    return owners
+
+
+def wechat_source_label(pid):
+    """Return a session-local account label only when multiple WeChat instances run."""
+    if not pid:
+        return ""
+    pids = sorted(_wechat_tray_owner_windows())
+    if len(pids) < 2 or int(pid) not in pids:
+        return ""
+    # Numbering is deterministic for the current processes; it is not a WeChat user ID.
+    return f"来自微信{pids.index(int(pid)) + 1}"
+
+
+def pending_wechat_source_label(pending_windows):
+    """Use the most recently pending real instance as the capsule's visible source."""
+    pids = [int(pid) for pid in pending_windows.values() if int(pid) > 0]
+    return wechat_source_label(pids[-1]) if pids else ""
+
+
+def _wechat_tray_button_controls():
+    """Read WeChat buttons from the Explorer notification area via UI Automation."""
+    if _uia is None:
+        return []
+    controls = []
+    traversable = {
+        "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+        "Windows.UI.Composition.DesktopWindowContentBridge",
+        "Windows.UI.Input.InputSite.WindowClass",
+        "Taskbar.TaskbarFrameAutomationPeer", "",
+    }
+    try:
+        stack = [(control, 0) for control in _uia.GetRootControl().GetChildren()]
+        while stack:
+            control, depth = stack.pop()
+            class_name = getattr(control, "ClassName", "") or ""
+            automation_id = getattr(control, "AutomationId", "") or ""
+            if (class_name == "SystemTray.NormalButton"
+                    and automation_id == "NotifyItemIcon"):
+                name_lines = (getattr(control, "Name", "") or "").strip().splitlines()
+                name = name_lines[0].strip() if name_lines else ""
+                if name.lower() in WECHAT_TITLES and not control.IsOffscreen:
+                    controls.append(control)
+                continue
+            if depth < 7 and class_name in traversable:
+                try:
+                    stack.extend((child, depth + 1) for child in control.GetChildren())
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return controls
+
+
+def _tray_icon_rects(owner_hwnd):
+    """Read tray-icon bounds registered by an owner HWND; never sends it messages."""
+    get_rect = getattr(_shell, "Shell_NotifyIconGetRect", None)
+    if get_rect is None:
+        return []
+    get_rect.argtypes = [ctypes.POINTER(NOTIFYICONIDENTIFIER),
+                         ctypes.POINTER(wintypes.RECT)]
+    get_rect.restype = ctypes.c_long
+    rects = []
+    for uid in range(256):
+        identity = NOTIFYICONIDENTIFIER(
+            ctypes.sizeof(NOTIFYICONIDENTIFIER), owner_hwnd, uid, GUID())
+        rect = wintypes.RECT()
+        try:
+            if get_rect(ctypes.byref(identity), ctypes.byref(rect)) == 0:
+                rects.append((int(rect.left), int(rect.top),
+                              int(rect.right), int(rect.bottom)))
+        except (OSError, ctypes.ArgumentError):
+            return []
+    return rects
+
+
+def _tray_rect_matches(shell_rect, control_rect):
+    """Allow the 1 px bounds difference seen between Shell and UIA coordinates."""
+    shell_x = (shell_rect[0] + shell_rect[2]) / 2
+    shell_y = (shell_rect[1] + shell_rect[3]) / 2
+    control_x = (control_rect[0] + control_rect[2]) / 2
+    control_y = (control_rect[1] + control_rect[3]) / 2
+    return abs(shell_x - control_x) <= 4 and abs(shell_y - control_y) <= 4
+
+
+def _activate_wechat_tray_button(target_pid):
+    """Invoke the exact WeChat tray item; fail closed when PID mapping is unclear."""
+    owners = _wechat_tray_owner_windows()
+    buttons = _wechat_tray_button_controls()
+    if not owners or len(owners) != len(buttons):
+        return False
+
+    mapped = {}
+    used_controls = set()
+    for pid, owner_hwnd in owners.items():
+        rects = _tray_icon_rects(owner_hwnd)
+        if len(rects) > 1:
+            return False
+        if not rects:
+            continue
+        matches = []
+        for control in buttons:
+            try:
+                bounds = control.BoundingRectangle
+                control_rect = (bounds.left, bounds.top, bounds.right, bounds.bottom)
+                if _tray_rect_matches(rects[0], control_rect):
+                    matches.append(control)
+            except Exception:
+                continue
+        if len(matches) != 1 or id(matches[0]) in used_controls:
+            return False
+        mapped[pid] = matches[0]
+        used_controls.add(id(matches[0]))
+
+    remaining_pids = [pid for pid in owners if pid not in mapped]
+    remaining_controls = [control for control in buttons
+                          if id(control) not in used_controls]
+    if remaining_pids or remaining_controls:
+        # A remaining pair is unambiguous only when all other accounts were anchored.
+        if (len(remaining_pids) != 1 or len(remaining_controls) != 1
+                or len(mapped) != len(owners) - 1
+                or (len(owners) > 1 and not mapped)):
+            return False
+        mapped[remaining_pids[0]] = remaining_controls[0]
+
+    control = mapped.get(int(target_pid))
+    if control is None:
+        return False
+    try:
+        invoke = control.GetInvokePattern()
+        if invoke is None:
+            return False
+        invoke.Invoke()
+        return True
+    except Exception:
+        return False
+
+
+def open_wechat_target(pending_windows, last_opened_hwnd):
+    """Use the selected account's native tray action instead of forcing its main HWND."""
+    hwnd = next_pending_window_handle(pending_windows, last_opened_hwnd)
+    if hwnd is not None:
+        pid = wintypes.DWORD(0)
+        _u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return bool(pid.value and _activate_wechat_tray_button(pid.value)), hwnd
+    if any(handle != 0 for handle in pending_windows):
+        return False, None
+    try:
+        os.startfile("weixin://")
+        return True, None
+    except OSError:
+        return False, None
+
+
 def find_wechat_window(exe_names):
     """返回唯一显示中的微信主窗口；有多个候选时不猜测。"""
     matches = []
@@ -290,10 +558,10 @@ def find_wechat_window(exe_names):
 class ShellHookListener(threading.Thread):
     """
     在独立线程里创建隐藏窗口并跑消息循环。
-    通过 on_event(kind, exe_path) 回调（在本线程内触发）：
+    通过 on_event(kind, payload) 回调（在本线程内触发）：
       kind = "flash"      微信请求任务栏关注
       kind = "activated"  微信窗口被激活（用户已看到）
-      kind = "raw"        仅 probe 模式：任意窗口的 flash/redraw/activate 事件
+      kind = "raw"        仅 probe 模式：事件及窗口句柄、进程 ID
     """
 
     def __init__(self, exe_names, on_event, probe=False, tray_enabled=False):
@@ -330,20 +598,30 @@ class ShellHookListener(threading.Thread):
         mask = (1 << (8 * ctypes.sizeof(ctypes.c_void_p))) - 1
         target = lparam & mask
         wechat, exe, title = self._classify_window(target)
+        target_pid = wintypes.DWORD(0)
+        _u.GetWindowThreadProcessId(target, ctypes.byref(target_pid))
+        main_hwnd = (resolve_wechat_main_window(
+            target, target_pid.value, self.exe_names) if wechat else 0)
+        state_key = main_hwnd or -int(target_pid.value or target or 1)
 
         if self.probe:
-            self.on_event("raw", (code, exe or "?", wechat, title))
+            self.on_event("raw", (code, exe or "?", wechat, title,
+                                   int(target), int(target_pid.value),
+                                   int(main_hwnd)))
         if not wechat:
             return
 
         if code == HSHELL_FLASH:
-            # 微信已在前台时不算新提醒
+            # 只忽略同一微信实例的前台窗口；另一个登录实例仍需单独提醒。
             fg = _u.GetForegroundWindow()
             if self._classify_window(fg)[0]:
-                return
-            self.on_event("flash", exe)
+                fg_pid = wintypes.DWORD(0)
+                _u.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+                if fg_pid.value == target_pid.value:
+                    return
+            self.on_event("flash", (int(state_key), int(target_pid.value)))
         elif code in (HSHELL_WINDOWACTIVATED, HSHELL_RUDEAPPACTIVATED):
-            self.on_event("activated", exe)
+            self.on_event("activated", (int(state_key), int(target_pid.value)))
 
     def _add_tray_icon(self, hwnd):
         if self.tray_data is not None:
@@ -926,7 +1204,8 @@ class IslandRenderer:
         return Image.alpha_composite(base, layer)
 
     # -- 主渲染
-    def render(self, w, h, ea=0.0, ca=0.0, pending=False, hover_dot=True):
+    def render(self, w, h, ea=0.0, ca=0.0, pending=False, hover_dot=True,
+               source_label=""):
         s, ss, CW, CH = self.s, self.SS, self.CW, self.CH
         w = max(w, 8 * s)
         h = max(h, 8 * s)
@@ -1006,7 +1285,8 @@ class IslandRenderer:
             label_left = x0 + 12 * s + ic.width + 8 * s
             label_right = dx - dot_r - 8 * s
             self._text(
-                d, ((label_left + label_right) / 2.0, cy), "有新消息待查看",
+                d, ((label_left + label_right) / 2.0, cy),
+                source_label or "有新消息待查看",
                 self.f_compact, (190, 190, 198, 255), anchor="mm",
             )
             if pending:
@@ -1023,7 +1303,9 @@ class IslandRenderer:
             d = ImageDraw.Draw(layer)
             tx = lx + ic.width + 12 * s
             self._text(d, (tx, cy - 10 * s), "微信", self.f_title, (255, 255, 255, 255))
-            self._text(d, (tx, cy + 11 * s), "有新提醒 · 点击打开", self.f_sub, (152, 152, 160, 255))
+            subtitle = (f"{source_label} · 点击打开" if source_label
+                        else "有新提醒 · 点击打开")
+            self._text(d, (tx, cy + 11 * s), subtitle, self.f_sub, (152, 152, 160, 255))
             r = 4.5 * s
             dx = x0 + w - 24 * s
             d.ellipse([dx - r, cy - r, dx + r, cy + r], fill=(46, 204, 113, 255))
@@ -1185,6 +1467,9 @@ class LayeredCapsule:
         # 动画状态
         self.state = "idle"        # idle / compact / expanded
         self.pending = False
+        self.pending_windows = {}   # 主窗口 HWND -> PID；负数表示未解析主窗；0 表示手动提醒
+        self.source_label = ""
+        self.last_opened_hwnd = None
         self.hover = False
         self.wspr = Spring(S * self.W_IDLE)
         self.hspr = Spring(S * self.H_IDLE)
@@ -1245,6 +1530,7 @@ class LayeredCapsule:
     def _push(self):
         img = self.renderer.render(
             self.wspr.x, self.hspr.x, self.ea, self.ca, self.pending,
+            source_label=self.source_label,
         )
         x = int(round(self.xspr.x - self.renderer.CW / 2.0))
         y = int(round(self.yspr.x - self.renderer.top))
@@ -1332,19 +1618,44 @@ class LayeredCapsule:
         self.hover = False
         self._go("compact" if self.pending else "idle")
 
-    def _on_flash(self):
-        if self.pending:           # 重复闪动合并，不重复弹出、不延长预览
+    def _on_flash(self, hwnd=0, pid=0):
+        key = int(hwnd or 0)
+        if key in self.pending_windows:  # 同一窗口的重复闪动合并
             return
+        self.pending_windows[key] = int(pid or 0)
         self.pending = True
+        self.source_label = wechat_source_label(pid)
         self._go("expanded")
         self._schedule_collapse(self.PREVIEW_MS)
 
-    def _clear(self):
-        if not self.pending:
+    def _clear(self, hwnd=0, pid=0):
+        key = int(hwnd or 0)
+        removed = False
+        if key and 0 in self.pending_windows:
+            self.pending_windows.pop(0, None)
+            removed = True
+        if key in self.pending_windows:
+            self.pending_windows.pop(key, None)
+            removed = True
+        elif key == 0 and 0 in self.pending_windows:
+            self.pending_windows.pop(0, None)
+            removed = True
+        else:
+            # 激活事件偶尔可能指向同一进程的代理窗口；只有唯一候选时才回退按 PID 清除。
+            candidates = [handle for handle, owner_pid in self.pending_windows.items()
+                          if handle and pid and owner_pid == int(pid)]
+            if len(candidates) == 1:
+                self.pending_windows.pop(candidates[0], None)
+                removed = True
+        if not removed:
             return
-        self.pending = False
+        self.pending = bool(self.pending_windows)
+        self.source_label = pending_wechat_source_label(self.pending_windows)
         self.hover = False
         self._cancel_collapse()
+        if self.pending:
+            self._go("compact")
+            return
         self._go("idle")
 
     # -- 交互：悬停 / 点击 / 拖动
@@ -1389,10 +1700,10 @@ class LayeredCapsule:
         if was_drag:
             save_position((self.xspr.x, self.yspr.x))
         else:
-            try:
-                os.startfile("weixin://")  # 让微信自己恢复窗口，避免强制 ShowWindow 导致白屏
-            except OSError:
-                pass
+            opened, hwnd = open_wechat_target(
+                self.pending_windows, self.last_opened_hwnd)
+            if hwnd is not None:
+                self.last_opened_hwnd = hwnd
 
     def _on_right_click(self, event):
         try:
@@ -1403,11 +1714,11 @@ class LayeredCapsule:
     def _poll(self):
         try:
             while True:
-                kind, _payload = self.events.get_nowait()
+                kind, payload = self.events.get_nowait()
                 if kind == "flash":
-                    self._on_flash()
+                    self._on_flash(*payload)
                 elif kind == "activated":
-                    self._clear()
+                    self._clear(*payload)
                 elif kind == "tray_restore":
                     self._reset_position()
                 elif kind == "tray_exit":
@@ -1436,6 +1747,7 @@ class TkCapsule:
     KEY = "#010101"          # 透明色键
     H = 34
     W_IDLE = 92
+    W_COMPACT = 180
     W_PREVIEW = 250
     TOP = 8
     PREVIEW_MS = 5000
@@ -1472,6 +1784,9 @@ class TkCapsule:
         self.canvas.pack(fill="both", expand=True)
 
         self.pending = False
+        self.pending_windows = {}   # 主窗口 HWND -> PID；负数表示未解析主窗；0 表示手动提醒
+        self.source_label = ""
+        self.last_opened_hwnd = None
         self.w = float(self.W_IDLE)
         self.target = float(self.W_IDLE)
         self.anim = None
@@ -1514,9 +1829,16 @@ class TkCapsule:
         dot_color = self.GREEN if self.pending else self.GREY
         cy = h // 2
         c.create_oval(14, cy - 5, 24, cy + 5, fill=dot_color, outline="")
-        if self.w > 170:
+        if self.w > 210:
+            subtitle = (f"{self.source_label} · 点击打开" if self.source_label
+                        else "微信有新提醒 · 点击打开")
             c.create_text(34, cy, anchor="w", fill=self.FG, font=self.FONT,
-                          text="微信有新提醒 · 点击打开")
+                          text=subtitle)
+        elif self.w > 120:
+            c.create_text(34, cy, anchor="w",
+                          fill=self.FG if self.pending else self.FG_DIM,
+                          font=self.FONT,
+                          text=self.source_label or "有新消息待查看")
         elif self.w > 70:
             c.create_text(34, cy, anchor="w",
                           fill=self.FG if self.pending else self.FG_DIM,
@@ -1544,10 +1866,13 @@ class TkCapsule:
         self._draw()
 
     # -- 状态
-    def _on_flash(self):
-        if self.pending:           # 重复闪动合并，不延长预览
+    def _on_flash(self, hwnd=0, pid=0):
+        key = int(hwnd or 0)
+        if key in self.pending_windows:  # 同一窗口的重复闪动合并
             return
+        self.pending_windows[key] = int(pid or 0)
         self.pending = True
+        self.source_label = wechat_source_label(pid)
         self._set_target(self.W_PREVIEW)
         if self.collapse_job:
             self.root.after_cancel(self.collapse_job)
@@ -1555,16 +1880,34 @@ class TkCapsule:
 
     def _collapse(self):
         self.collapse_job = None
-        self._set_target(self.W_IDLE)
+        self._set_target(self.W_COMPACT if self.pending else self.W_IDLE)
 
-    def _clear(self):
-        if not self.pending:
+    def _clear(self, hwnd=0, pid=0):
+        key = int(hwnd or 0)
+        removed = False
+        if key and 0 in self.pending_windows:
+            self.pending_windows.pop(0, None)
+            removed = True
+        if key in self.pending_windows:
+            self.pending_windows.pop(key, None)
+            removed = True
+        elif key == 0 and 0 in self.pending_windows:
+            self.pending_windows.pop(0, None)
+            removed = True
+        else:
+            candidates = [handle for handle, owner_pid in self.pending_windows.items()
+                          if handle and pid and owner_pid == int(pid)]
+            if len(candidates) == 1:
+                self.pending_windows.pop(candidates[0], None)
+                removed = True
+        if not removed:
             return
-        self.pending = False
+        self.pending = bool(self.pending_windows)
+        self.source_label = pending_wechat_source_label(self.pending_windows)
         if self.collapse_job:
             self.root.after_cancel(self.collapse_job)
             self.collapse_job = None
-        self._set_target(self.W_IDLE)
+        self._set_target(self.W_COMPACT if self.pending else self.W_IDLE)
         self._draw()
 
     # -- 交互
@@ -1599,9 +1942,11 @@ class TkCapsule:
         self._place()
 
     def _on_click(self, _event):
-        try:
-            os.startfile("weixin://")  # 让微信自己恢复窗口，避免强制 ShowWindow 导致白屏
-        except OSError:
+        opened, hwnd = open_wechat_target(
+            self.pending_windows, self.last_opened_hwnd)
+        if hwnd is not None:
+            self.last_opened_hwnd = hwnd
+        if not opened:
             self._toast_error()
 
     def _toast_error(self):
@@ -1620,11 +1965,11 @@ class TkCapsule:
     def _poll(self):
         try:
             while True:
-                kind, _payload = self.events.get_nowait()
+                kind, payload = self.events.get_nowait()
                 if kind == "flash":
-                    self._on_flash()
+                    self._on_flash(*payload)
                 elif kind == "activated":
-                    self._clear()
+                    self._clear(*payload)
                 elif kind == "tray_restore":
                     self._reset_position()
                 elif kind == "tray_exit":
@@ -1683,7 +2028,7 @@ def run_probe(names, seconds, show_all):
     def on_event(kind, payload):
         if kind != "raw":
             return
-        code, exe, wechat, title = payload
+        code, exe, wechat, title, hwnd, pid, main_hwnd = payload
         if code == HSHELL_FLASH:
             counts["all_flash"] += 1
         if wechat:
@@ -1698,7 +2043,9 @@ def run_probe(names, seconds, show_all):
             tag = "WECHAT" if wechat else "other "
             extra = f"  title={title!r}" if title else ""
             print(f"[{time.strftime('%H:%M:%S')}] {tag} "
-                  f"{CODE_NAMES.get(code, hex(code)):9s} {exe}{extra}")
+                  f"{CODE_NAMES.get(code, hex(code)):9s} {exe} "
+                  f"hwnd=0x{hwnd:X} pid={pid} "
+                  f"main=0x{main_hwnd:X}{extra}")
 
     print("== 环境信息 ==")
     print(f"Python: {sys.version.split()[0]} ({struct.calcsize('P') * 8} 位)  {sys.executable}")
