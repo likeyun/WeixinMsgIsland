@@ -1058,7 +1058,7 @@ GITHUB_LATEST_RELEASE_API = (
     "https://api.github.com/repos/likeyun/WeixinMsgIsland/releases/latest"
 )
 GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 THEME_DEFAULT = "default"
 THEME_LIQUID_GLASS = "liquid_glass"
 THEME_MILK = "glass_milk"
