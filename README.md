@@ -1,6 +1,6 @@
 # WeixinMsgIsland
 
-微信电脑版消息通知灵动岛提醒（Windows）。程序监听 Windows Shell Hook 的任务栏闪烁事件，在屏幕顶部显示提醒胶囊；不读取聊天内容，也不统计未读条数。
+微信电脑版消息通知灵动岛提醒（Windows）。程序监听 Windows Shell Hook 的任务栏闪烁事件，在屏幕顶部显示提醒胶囊；不读取微信聊天内容，也不统计微信未读条数。程序还可同时启动局域网消息接收接口，将外部软件发送的消息摘要显示在灵动岛，并保存完整原文到本机。
 
 ## 功能
 
@@ -8,8 +8,15 @@
 - 胶囊按闪烁账号调用对应的微信托盘项，使用微信自己的窗口恢复流程；窗口激活后自动清除提醒。
 - 多开微信时显示“来自微信N”，单开时保持原有提醒文案；编号按当前实例 PID 顺序分配。
 - 空闲时显示拟物化镜头孔圆点；提醒胶囊带柔和阴影。
-- 通知区托盘图标提供“恢复胶囊位置”和“退出”菜单。
+- 通知区托盘图标提供“消息记录”“恢复胶囊位置”“复制接口”“查看文档”“GitHub”“检查更新”和“退出”菜单；胶囊右键菜单也提供接口、文档、GitHub 和更新入口。检查更新会读取 GitHub 最新正式发行版，发现新版时可打开发行页。
 - 支持拖动位置、自定义微信图标和事件诊断模式。
+- 右键胶囊可在默认黑色样式和 9 款程序化玻璃主题间实时切换，主题选择会保存在用户配置中。
+- 玻璃主题按形状蒙版绘制底色、细边缘光与动态光带；只对窄边缘做轻量柔化，不用整块白雾或厚重阴影。需要屏幕底色时，在后台内存采样胶囊后方的小区域，不会把截图写入磁盘。
+- 启动灵动岛时同步启动局域网 `GET /receive` 接口，兼容 `content` 和 `token` 查询参数。
+- 接收的消息正文、来源 IP、时间和已读状态保存在本机 SQLite；新消息在灵动岛直接显示发送人和正文摘要，清理“来自”和条数前缀；无法识别发送人时显示“微信消息”，并过滤应用包名、UID、时间及设备标记，不另开弹窗。
+- 有接口消息时点击胶囊，单个分层窗口会以弹簧形变向下展开为详情岛；胶囊与详情共用同一个黑色轮廓、Alpha 蒙版和阴影，不再创建第二个面板窗口。顶部消息区保持固定，面板高度按内容自适应；长内容可滚轮浏览且不显示滚动条。详情打开时鼠标移出不会意外收起；当前消息与历史记录可切换，单条或全部标记已读；没有接口消息时点击仍按原行为唤起微信。
+- 展开的消息详情界面双击，可将全部接口消息标为已读、收起详情面板并唤起对应微信实例。
+- 当前消息页可手动标记已读；历史页选择消息会标为已读，也可批量标记。右键胶囊或托盘图标可直接打开历史消息页。
 
 提醒依赖微信和 Windows 发出任务栏闪烁事件。若微信没有发出该事件，程序无法保证显示提醒。
 如果无法把微信托盘项唯一对应到提醒账号，胶囊会停止本次唤起，不会强制显示其他微信窗口。
@@ -22,14 +29,22 @@
 
 ## 运行
 
-仅支持 Windows。使用 Python 运行时，UI Automation 用于把每个微信托盘项对应到具体账号；Pillow 用于更精细的动画和透明渲染，没有 Pillow 时会回退到简易界面。
+仅支持 Windows。使用 Python 运行时，UI Automation 用于把每个微信托盘项对应到具体账号；Pillow 和 NumPy 用于动画、透明渲染和程序化玻璃材质，没有 Pillow 时会回退到简易界面。
 
 ```powershell
-python -m pip install Pillow uiautomation
+python -m pip install Pillow numpy uiautomation
 pythonw .\wechat_capsule.py
 ```
 
 `pythonw` 会隐藏控制台；点击右下角托盘图标，在菜单中选择“退出”即可关闭后台进程。调试时可改用 `python .\wechat_capsule.py` 保留控制台。
+
+程序默认在 `0.0.0.0:8080` 启动消息接口。首次启动时会随机生成接口令牌并保存在 `%APPDATA%\wechat_capsule.json`，后续启动继续使用该令牌。通过托盘或胶囊右键菜单的“复制接口”可以复制带有当前局域网 IP、端口和令牌的示例 URL，将 `[msg]` 替换成要发送的内容：
+
+```text
+http://<本机局域网IP>:8080/receive?content=[msg]&token=<随机生成的令牌>
+```
+
+也可以通过 `--receive-token` 临时覆盖配置中的令牌，通过 `--receive-port` 修改端口。接收记录保存在 `%APPDATA%\WeixinMsgIsland\messages.sqlite3`。若 8080 端口被占用，灵动岛会提示接口无法启动；请先停止旧的独立接收服务。局域网其他设备无法连接时，请允许程序通过 Windows 防火墙的专用网络访问。
 
 常用参数：
 
@@ -41,11 +56,27 @@ python .\wechat_capsule.py --exe Weixin.exe
 
 右键胶囊可模拟提醒、恢复默认位置或退出。`--icon` 可指定 PNG 图标，`--tk` 可强制使用简易 Tk 界面。
 
+右键胶囊后打开“样式”，可即时切换以下材质：
+
+1. 乳白玻璃
+2. 银边深色玻璃
+3. 蓝色流光
+4. 柔彩虹玻璃
+5. 液态玻璃水滴
+6. RGB 霓虹边
+7. 青绿呼吸边
+8. 日光彩谱
+9. 青绿极光
+
+第 5 款会轻微折射胶囊后方的桌面画面，边缘带有顶部移动高光与底部冷色反射，展开后沿同一轮廓延续。
+
+样式保存在 `%APPDATA%\wechat_capsule.json`；重新启动后会恢复上次选择。旧版“液态玻璃”配置会迁移到银边深色玻璃，旧版“极透玻璃”会迁移到液态玻璃水滴。若系统无法提供屏幕采样，各主题仍使用程序生成的基底与边缘效果。
+
 ## 打包 EXE
 
 ```powershell
 python -m pip install -r requirements-build.txt
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name "微信消息胶囊" --icon "wechat_capsule.ico" --add-data "wechat_capsule.ico;." --collect-all uiautomation "wechat_capsule.py"
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name "微信消息胶囊" --icon "wechat_capsule.ico" --add-data "wechat_capsule.ico;." --collect-all uiautomation --collect-all numpy "wechat_capsule.py"
 ```
 
 生成文件位于 `dist\微信消息胶囊.exe`。托盘图标资源会打包进单文件 EXE。
@@ -61,4 +92,3 @@ python .\wechat_capsule.py --probe --all --seconds 60
 ```
 
 诊断模式会在控制台列出 Shell Hook 收到的事件，用于判断微信是否发出了任务栏闪烁事件。
-
